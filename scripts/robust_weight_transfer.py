@@ -36,9 +36,9 @@ try:  # 任意: あれば直接法で高速に解く
 except Exception:  # pragma: no cover
     HAS_SCIPY = False
 
-__version__ = "2.4.0"
+__version__ = "3.0.0"
 WINDOW = "robustWeightTransferWin"
-_last_inpainted = {"mesh": None, "ids": []}
+_last_inpainted = {"mesh": None, "ids": [], "unsolved": []}
 _PENDING = {}  # rwtSetSkinWeights コマンドへの受け渡し用
 _PLUGIN = "rwt_undo_cmd"
 LAYER_CLOSEST = "RWT_Closest"
@@ -396,6 +396,58 @@ def _inpaint(pts, tris, known, w_known, max_iter=4000, tol=1e-7, log=print, clam
     return W, orphan
 
 
+def _area_weighted_normals(pts, tris):
+    """libigl per_vertex_normals(既定=面積重み)と同じ頂点法線。公式実装と判定を揃えるため。"""
+    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+    fn = np.cross(b - a, c - a)  # 長さ = 2 * 面積 -> 面積重み
+    out = np.zeros_like(pts)
+    for k in range(3):
+        np.add.at(out, tris[:, k], fn)
+    return _normalize(out)
+
+
+def _adjacency(n, tris):
+    """igl.adjacency_list 相当(重複なし・昇順)を CSR 形式で返す。"""
+    e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+    e = np.concatenate([e, e[:, ::-1]])
+    e = np.unique(e, axis=0)
+    e = e[e[:, 0] != e[:, 1]]
+    start = np.searchsorted(e[:, 0], np.arange(n + 1))
+    return start, e[:, 1]
+
+
+def _smooth_official(pts, tris, W, matched, radius, iterations, alpha):
+    """公式 Python 実装 utils.smooth の移植(対象範囲の選び方・更新順まで同じ)。
+
+    対象 = 補間頂点 + 各補間頂点からメッシュの接続をたどって radius 以内にある頂点。
+    頂点番号順に、その場で(Gauss-Seidel 的に)更新する。
+    """
+    n = len(pts)
+    start, nbr = _adjacency(n, tris)
+    region = ~matched.copy()
+    for vid in np.where(~matched)[0]:  # 公式と同じ順序・条件で領域を広げる
+        stack = [vid]
+        p0 = pts[vid]
+        while stack:
+            vv = stack.pop()
+            for nn in nbr[start[vv]:start[vv + 1]]:
+                if not region[nn] and np.linalg.norm(p0 - pts[nn]) < radius:
+                    region[nn] = True
+                    stack.append(nn)
+    cols = np.where(np.abs(W).sum(0) > 0)[0]
+    X = W[:, cols].copy()
+    idx = np.where(region)[0]
+    for _ in range(int(iterations)):
+        for i in idx:
+            nb = nbr[start[i]:start[i + 1]]
+            if len(nb) == 0:
+                continue
+            X[i] = (1.0 - alpha) * X[i] + X[nb].sum(0) * (alpha / len(nb))
+    W = W.copy()
+    W[:, cols] = X
+    return W, region
+
+
 def _smooth_region(pts, seeds, radius):
     """公式実装と同じく、補間頂点 + それらから radius 以内の頂点をスムース対象にする。"""
     region = seeds.copy()
@@ -438,8 +490,9 @@ def _smooth(W, edges, movable, iterations, strength):
 
 
 def _postprocess(W, max_inf, prune=1e-4):
-    W = np.clip(W, 0.0, None)
-    W[W < prune] = 0.0
+    W = np.clip(W, 0.0, None)  # 論文 3.2: 負の値は 0 にして正規化
+    if prune:
+        W[W < prune] = 0.0
     if max_inf and max_inf > 0 and W.shape[1] > max_inf:
         # 上位 max_inf 個だけ残す
         idx = np.argsort(-W, axis=1)[:, max_inf:]
@@ -456,10 +509,15 @@ def _postprocess(W, max_inf, prune=1e-4):
 def transfer(source, target, dist_ratio=0.05, angle=30.0, allow_flip=False,
              max_influences=None, smooth_iter=10, smooth_strength=0.2,
              mask_vertices=None, output="skin", weld=True, clamp_cot=False,
-             interp="mesh", dist_abs=None, log=None):
+             interp="mesh", dist_abs=None, mode="paper", log=None):
     """source のスキンウェイトを target に Robust Skin Weights Transfer で転写する。
 
-    既定値は論文の公式実装(rin-23/RobustSkinWeightsTransferCode)に合わせている。
+    mode : "paper"    = 論文準拠。公式 Python 実装(rin-23/RobustSkinWeightsTransferCode の
+                        src/utils.py)と同じ処理だけを行う。独自処理(溶接・別パーツ救済・
+                        インフルエンス数の制限・小さい値の削除・点群補間・安全モード)は使わない。
+                        weld / interp / clamp_cot / max_influences は無視される。
+           "extended" = 拡張。溶接・別パーツ救済・点群補間・インフルエンス数の制限などを使う。
+    既定値は公式 Python 実装に合わせている(角度 30°。論文本文では 35°)。
 
     dist_ratio : ターゲットのバウンディングボックス対角長に対する距離しきい値(公式 0.05)
     dist_abs   : 距離しきい値を cm で直接指定(指定時は dist_ratio より優先。Blender版は 5cm)
@@ -484,16 +542,19 @@ def transfer(source, target, dist_ratio=0.05, angle=30.0, allow_flip=False,
     # バインド・インフルエンス追加・ウェイト書き込みをまとめて1回のUndoで戻せるようにする
     cmds.undoInfo(openChunk=True, chunkName="RobustWeightTransfer")
     try:
+        if mode == "paper":
+            weld, interp, clamp_cot = False, "mesh", False
         return _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
                          smooth_iter, smooth_strength, mask_vertices, output, weld,
-                         clamp_cot, interp, dist_abs, log)
+                         clamp_cot, interp, dist_abs, mode, log)
     finally:
         cmds.undoInfo(closeChunk=True)
 
 
 def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
               smooth_iter, smooth_strength, mask_vertices, output, weld, clamp_cot,
-              interp, dist_abs, log):
+              interp, dist_abs, mode, log):
+    paper = mode == "paper"
     t0 = time.time()
     src_shape = _mesh_shape(source)
     tgt_shape = _mesh_shape(target)
@@ -502,7 +563,9 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
         raise RuntimeError(u"ソースにskinClusterがありません: %s" % source)
 
     influences = cmds.skinCluster(src_skin, q=True, inf=True)
-    if max_influences is None:
+    if paper:
+        max_influences = 0  # 論文準拠では制限しない
+    elif max_influences is None:
         max_influences = cmds.getAttr(src_skin + ".maxInfluences")
 
     # --- ターゲットのskinCluster準備(なければ作る) ---
@@ -523,23 +586,29 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
             log(u"ターゲットにインフルエンスを %d 個追加しました" % len(missing))
 
     # --- ジオメトリ ---
-    _, _, src_pts, src_nrm, _ = _mesh_arrays(src_shape)
+    _, _, src_pts, src_nrm, src_tris = _mesh_arrays(src_shape)
     tgt_dag, _, tgt_pts, tgt_nrm, tgt_tris = _mesh_arrays(tgt_shape)
+    if paper:  # 公式と同じ面積重みの頂点法線で判定する
+        src_nrm = _area_weighted_normals(src_pts, src_tris)
+        tgt_nrm = _area_weighted_normals(tgt_pts, tgt_tris)
     bb = tgt_pts.max(0) - tgt_pts.min(0)  # 公式実装と同じくターゲット基準
     diag = float(np.linalg.norm(bb))
     # API のワールド座標は内部単位(cm)なので dist_abs も cm
     dist_thresh = float(dist_abs) if dist_abs else dist_ratio * diag
-    log(u"距離しきい値 %.3f / 角度 %.1f度 / 最大インフルエンス %d"
-        % (dist_thresh, angle, max_influences))
+    log(u"[%s] 距離しきい値 %.3f cm / 角度 %.1f度 / 最大インフルエンス %s"
+        % (u"論文準拠" if paper else u"拡張", dist_thresh, angle,
+           max_influences or u"制限なし"))
 
     # --- Step1: 最近接点 ---
     t = time.time()
     tri_v, bary, known, dist = _closest_point_match(
         src_shape, src_pts, src_nrm, tgt_pts, tgt_nrm, dist_thresh, angle, allow_flip)
     log(u"Step1 最近接点: 確定 %d / %d 頂点 (%.1fs)" % (known.sum(), len(known), time.time() - t))
+    masked = np.zeros(len(known), bool)
     if mask_vertices is not None and len(mask_vertices):
-        known[np.asarray(mask_vertices, dtype=np.int64)] = False
-        log(u"  マスク: %d 頂点を強制的に補間対象にしました" % len(mask_vertices))
+        masked[np.asarray(mask_vertices, dtype=np.int64)] = True
+        known[masked] = False
+        log(u"  マスク: %d 頂点を強制的に補間対象にしました" % masked.sum())
     known_step1 = known.copy()
 
     # ソースウェイトは参照される頂点ぶんだけ読む
@@ -569,12 +638,15 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
     w_dist = np.full(nw, np.inf)
     np.minimum.at(w_dist, wid, dist)
 
-    # 確定点を1つも持たない島(ポーチ・バックル等の別パーツ)は、法線条件を外して
-    # 距離が近い頂点を確定にする。それも無ければ島内で最も近い 10% を確定にする。
-    # -> 島の中も inpainting で滑らかに補間され、パーツがちぎれにくくなる。
+    # 確定点を1つも持たない島(ポーチ・バックル等の別パーツ)の扱い
+    #   論文準拠: 何もしない(補間できないので最近接の値を入れ、報告する)
+    #   拡張    : 法線条件を外して距離が近い頂点を確定にする。無ければ島内で最も近い 10%。
+    #             ただしマスクで「必ず補間」と指定された頂点は確定に戻さない。
     known = known.copy()
     w_known = np.zeros(nw, bool)
     w_known[wid[known]] = True
+    w_masked = np.zeros(nw, bool)
+    w_masked[wid[masked]] = True
     e = np.concatenate([w_tris[:, [0, 1]], w_tris[:, [1, 2]], w_tris[:, [2, 0]]])
     lap = None
     if interp == "pointcloud":
@@ -582,25 +654,28 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
         (lr_, lc_, _), _ = lap
         off = lr_ != lc_
         lab = _components(nw, lr_[off], lc_[off])  # 近傍グラフでつながりを判定
-        log(u"  補間モード: 点群(近傍グラフで別パーツもつなぐ)")
+        log(u"  補間: 点群(近傍グラフで別パーツもつなぐ)")
     else:
         lab = _components(nw, e[:, 0], e[:, 1])
-        log(u"  補間モード: メッシュ(論文どおり)")
+        log(u"  補間: メッシュ(cot ラプラシアン)")
     comp_has = np.zeros(nw, bool)
     comp_has[lab[w_known]] = True
     orphan_w = ~comp_has[lab]
-    n_islands = 0
-    if orphan_w.any():
+    if orphan_w.any() and not paper:
+        n_islands = 0
         for c in np.unique(lab[orphan_w]):
             members = np.where(lab == c)[0]
-            sel = members[w_dist[members] <= dist_thresh]
+            cand = members[~w_masked[members]]
+            if len(cand) == 0:
+                continue  # 全部マスク -> 救済しない(未解決として報告)
+            sel = cand[w_dist[cand] <= dist_thresh]
             if len(sel) == 0:
-                k = max(1, int(math.ceil(len(members) * 0.1)))
-                sel = members[np.argsort(w_dist[members])[:k]]
+                k = max(1, int(math.ceil(len(cand) * 0.1)))
+                sel = cand[np.argsort(w_dist[cand])[:k]]
             w_known[sel] = True
             n_islands += 1
         known = w_known[wid]
-        log(u"  確定点のない島 %d 個を距離のみで補強" % n_islands)
+        log(u"  確定点のない別パーツ %d 個を距離のみで補強" % n_islands)
 
     kcount = np.bincount(wid[known], minlength=nw).astype(np.float64)
     Wk = np.zeros((nw, ninf))
@@ -614,24 +689,29 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
     if smooth_iter > 0 and smooth_strength > 0:
         w_step1 = np.zeros(nw, bool)
         w_step1[wid[known_step1]] = True
-        movable = _smooth_region(w_pts, ~w_step1, dist_thresh)
-        W_w = _smooth(W_w, e, movable, smooth_iter, smooth_strength)
-        log(u"  スムース %d 回 (強さ %.2f) を %d 頂点に適用(補間頂点+距離しきい値内の近傍)"
+        if paper:
+            W_w, movable = _smooth_official(w_pts, w_tris, W_w, w_step1, dist_thresh,
+                                            smooth_iter, smooth_strength)
+        else:
+            movable = _smooth_region(w_pts, ~w_step1, dist_thresh)
+            W_w = _smooth(W_w, e, movable, smooth_iter, smooth_strength)
+        log(u"  スムース %d 回 (強さ %.2f) を %d 頂点に適用"
             % (smooth_iter, smooth_strength, movable.sum()))
     W = W_w[wid]
     orphan_v = orphan[wid]
-    W[orphan_v] = W_cp[orphan_v]  # 既知点のない島は最近接ウェイトで代用
-    log(u"Step2 inpainting: 補間 %d 頂点 / 既知点なしの島 %d 頂点 (%.1fs)"
-        % ((~known).sum() - orphan_v.sum(), orphan_v.sum(), time.time() - t))
+    W[orphan_v] = W_cp[orphan_v]  # 補間できない頂点は最近接ウェイトで代用(報告する)
+    n_parts = len(np.unique(lab[orphan])) if orphan.any() else 0
+    log(u"Step2 inpainting: 補間 %d 頂点 / 補間できなかった別パーツ %d 個 (%d 頂点) (%.1fs)"
+        % ((~known).sum() - orphan_v.sum(), n_parts, orphan_v.sum(), time.time() - t))
 
-    W, bad = _postprocess(W, max_influences)
+    W, bad = _postprocess(W, max_influences, prune=0.0 if paper else 1e-4)
     if bad.any():
         W[bad] = W_cp[bad] / np.maximum(W_cp[bad].sum(1, keepdims=True), 1e-12)
 
     # --- 書き込み ---
     t = time.time()
     if output == "ngskin":
-        W_close, bad_c = _postprocess(W_cp, max_influences)
+        W_close, bad_c = _postprocess(W_cp, max_influences, prune=0.0 if paper else 1e-4)
         _write_ngskin_layers(tgt_skin, tgt_shape, tgt_dag, src_skin, influences,
                              W_close, W, ~known_step1, log)
     else:
@@ -641,9 +721,13 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
     inpainted = np.where(~known_step1)[0]
     _last_inpainted["mesh"] = cmds.listRelatives(tgt_shape, p=True, f=True)[0]
     _last_inpainted["ids"] = inpainted.tolist()
+    unsolved = np.where(orphan_v)[0]
+    _last_inpainted["unsolved"] = unsolved.tolist()
     log(u"完了: %s -> %s (合計 %.1fs)" % (source, target, time.time() - t0))
     return {"skinCluster": tgt_skin, "known": int(known_step1.sum()),
-            "inpainted": int(len(inpainted)), "orphan": int(orphan_v.sum())}
+            "inpainted": int(len(inpainted)), "orphan": int(orphan_v.sum()),
+            "unsolved_parts": int(n_parts), "unsolved": int(len(unsolved)),
+            "mesh": _last_inpainted["mesh"], "mode": mode}
 
 
 def _write_weights(tgt_skin, tgt_shape, tgt_dag, src_skin, src_infs, W):
@@ -746,40 +830,55 @@ def select_inpainted():
     cmds.select(["%s.vtx[%d]" % (mesh, i) for i in ids], r=True)
 
 
+def select_unsolved():
+    """補間できなかった頂点(コピーできる頂点が1つも無い別パーツ)を選択する。"""
+    mesh, ids = _last_inpainted["mesh"], _last_inpainted.get("unsolved", [])
+    if not mesh or not ids:
+        cmds.warning(u"補間できなかった頂点はありません")
+        return
+    cmds.select(["%s.vtx[%d]" % (mesh, i) for i in ids], r=True)
+
+
 # --------------------------------------------------------------------------
 # UI (Qt / PySide2・PySide6 両対応)
 # --------------------------------------------------------------------------
-# 論文の公式実装と同じ既定値
-DEFAULTS = {
-    "dist": 5.0, "angle": 30.0, "flip": False, "smooth_iter": 10, "smooth_strength": 0.2,
-    "max_inf": 0, "mask": False, "clamp": False, "output": 0, "select_after": False,
-    "interp": 0, "dist_unit": 0,
+MODE_PAPER, MODE_EXT = 0, 1
+MODE_NAMES = [u"論文準拠", u"拡張・小パーツ対応"]
+# モードごとの既定値
+#   論文準拠: 公式 Python 実装(src/utils.py, sphere_to_plane_transfer.py)と同じ値
+#   拡張    : 距離 5cm / 裏面あり / スムースなし / 最大 8 本(Blender アドオンの既定値を参考)
+MODE_DEFAULTS = {
+    MODE_PAPER: {
+        "dist": 5.0, "dist_unit": 0, "angle": 30.0, "flip": False, "smooth_iter": 10,
+        "smooth_strength": 0.2, "max_inf": 0, "mask": False, "clamp": False, "output": 0,
+        "select_after": False,
+    },
+    MODE_EXT: {
+        "dist": 5.0, "dist_unit": 1, "angle": 30.0, "flip": True, "smooth_iter": 0,
+        "smooth_strength": 0.2, "max_inf": 8, "mask": False, "clamp": False, "output": 0,
+        "select_after": False,
+    },
 }
-# Blender版(SentFromSpace robust-weight-transfer)の既定値に相当する設定
-#  距離 0.05m(=5cm, 絶対値) / 角度30 / 裏向き法線あり / 点群モード / スムースなし / 最大4本
-PRESET_BLENDER = {
-    "dist": 5.0, "dist_unit": 1, "angle": 30.0, "flip": True, "smooth_iter": 0,
-    "smooth_strength": 0.2, "max_inf": 4, "mask": False, "clamp": False, "output": 0,
-    "select_after": False, "interp": 1,
-}
-_OPT = "robustWeightTransfer2_"
+DEFAULTS = MODE_DEFAULTS[MODE_PAPER]
+_OPT = "robustWeightTransfer3_"
 
 # オプション説明(ツールチップとヘルプ画面で共用)
 HELP = [
     (u"ソース(体)", u"ウェイトのコピー元。スキン済みのメッシュを指定します。"),
     (u"ターゲット(服)", u"コピー先。スキンが無ければ、体と同じジョイントで自動バインドします。"),
-    (u"補間方法",
-     u"体から遠い頂点を、どうやって埋めるか。\n"
-     u"・標準(論文どおり): メッシュのつながりに沿って埋める。ほとんどの服はこちら。\n"
-     u"・小パーツも布に追従: 近くの点どうしで埋める。ボタンやポーチ等の別パーツも"
-     u"下の布と一緒に動く。体の近くの硬い物(バックパック等)は周りに引っ張られやすい。"),
+    (u"モード",
+     u"・論文準拠: 論文の公式 Python 実装と同じ処理だけを行う。比較・検証の基準。\n"
+     u"・拡張・小パーツ対応: 点群補間・頂点の溶接・別パーツの救済・インフルエンス数の制限を加える。"
+     u"ボタンやポーチ等も下の布と一緒に動きやすい。\n"
+     u"設定はモードごとに保存されます。"),
     (u"距離",
      u"服の頂点から体の表面までがこの距離以内なら、体のウェイトをそのままコピー。"
      u"遠い頂点は補間に回す。単位は % (服の大きさに対する割合) か cm。\n"
      u"上げる→コピーが増え最近接コピーに近づく / 下げる→補間が増える。"),
     (u"角度",
      u"服と体の向き(法線)がこの角度以上ずれた頂点は、近くてもコピーせず補間に回す。"
-     u"股や脇で反対側の脚・胴のウェイトを拾うのを防ぐ。"),
+     u"股や脇で反対側の脚・胴のウェイトを拾うのを防ぐ。\n"
+     u"既定 30°(公式 Python 実装の値。論文本文では 35°)。"),
     (u"裏向きの面もコピー",
      u"厚みのある服・裏地の内側の面(体と逆向き)もコピー対象にする。"
      u"補間される頂点が多すぎるときに試す。"),
@@ -788,13 +887,16 @@ HELP = [
      u"0回で無効。上げすぎるとウェイトがぼやける。"),
     (u"最大インフルエンス",
      u"1頂点あたりのジョイント数の上限。超えた分は小さい順に削る。"
-     u"エンジンの制限(4本・8本など)に合わせる。「体と同じ」は体のskinClusterの設定。"),
+     u"0 = 体の skinCluster の設定(maxInfluences)。論文準拠モードでは使わない(制限なし)。"),
     (u"選択頂点を必ず補間(マスク)",
      u"オンにして服の頂点を選択した状態で転写すると、その頂点は体からコピーせず周りから埋める。"
      u"襟が顎のウェイトを拾うとき等に。"),
     (u"安全モード",
      u"メッシュが壊れていて(潰れた三角形など)結果が乱れるときだけ使う。"
-     u"計算を安定させる代わりに論文の式から少し外れる。"),
+     u"計算を安定させる代わりに論文の式から少し外れる。拡張モードのみ。"),
+    (u"補間できなかった頂点",
+     u"コピーできる頂点が1つも無い別パーツは補間できないため、最近接コピーの値を入れて報告します。"
+     u"拡張モードでは距離だけで基準点を補って補間します(マスク指定した頂点は除く)。"),
     (u"出力先",
      u"・skinCluster: 普通に書き込む。\n"
      u"・ngSkinレイヤー: 下=最近接コピー / 上=補間結果+マスクの2枚。"
@@ -811,7 +913,7 @@ PAPER_URL = "https://www.dgp.toronto.edu/~rinat/projects/RobustSkinWeightsTransf
 HELP_DETAIL = [
     (u"使い方", [
         u"1. Maya で 体(スキン済み) → 服 の順に選択します。服は Ctrl / Shift で複数追加できます。",
-        u"2. 「転写」を押します。",
+        u"2. モードを選んで「転写」を押します。",
         u"服にスキンが無い場合は、体と同じジョイントで自動的にバインドします。",
         u"転写は Ctrl+Z 1回でまとめて元に戻せます(服を複数選んだ場合も1回)。",
         u"バインドポーズの状態で実行してください。",
@@ -819,36 +921,53 @@ HELP_DETAIL = [
     (u"しくみ", [
         u"Robust Skin Weights Transfer via Weight Inpainting(Abdrashitov et al., SIGGRAPH Asia 2023)の実装です。",
         u"① 体に近く、向きもそろっている服の頂点は、体の表面のウェイトをそのままコピーします。",
-        u"② それ以外の頂点(ゆったりした布、股・脇まわりなど)は、①の頂点から滑らかに補間します。",
-        u"既定値は論文の公式実装と同じで、補間結果は公式実装と数値的に一致することを確認済みです。",
+        u"② それ以外の頂点(ゆったりした布、股・脇まわりなど)は、①の頂点から滑らかに補間します"
+        u"(Q = -L + L M^-1 L の二次エネルギー最小化)。",
     ]),
-    (u"補間方法", [
-        u"標準: メッシュのつながりに沿って補間します(論文どおり)。ほとんどの服はこちらで問題ありません。",
-        u"小パーツ追従: メッシュのつながりを使わず、近くの点どうしで補間します。"
-        u"ボタン・ポーチ・バックル等の別パーツにも、すぐ下の布のウェイトが流れて一緒に動きます。",
-        u"注意: 小パーツ追従では、体の近くにある硬い物(バックパック等)が周囲の動きに引っ張られやすくなります。",
+    (u"モード: 論文準拠", [
+        u"論文の公式 Python 実装(rin-23/RobustSkinWeightsTransferCode の src/utils.py)と同じ処理だけを行います。"
+        u"結果が気になったときの比較の基準に使います。",
+        u"・マッチング: 面積重みの頂点法線、ターゲットの対角長 × 距離(%)、角度 30°",
+        u"・補間: L = 2 × cot ラプラシアン、M = ボロノイ混合面積(公式 Python 版と同じ。C++ 版は L = cot ラプラシアン)",
+        u"・スムース: 公式と同じく、補間頂点とそこからメッシュをたどって距離以内の頂点を、頂点番号順に 10回・0.2",
+        u"・最後に負の値を 0 にして正規化(論文 3.2 の処理)",
+        u"使わない処理: 頂点の溶接、別パーツの救済、インフルエンス数の制限、小さい値の削除、点群補間、安全モード。",
+        u"公式の球→平面データで、マッチング・補間・スムースとも公式 Python 版と一致することを確認しています"
+        u"(Maya 上の最終ウェイトで差 1.2e-8 以下。Maya の頂点座標が単精度のため)。"
+        u"実際の衣装では、Maya と libigl の最近接点計算の違いなどで差が出る可能性があります。",
+        u"FBX 由来の衣装など、UV の境目で頂点が分かれたメッシュでは、分かれた部分の多くが"
+        u"「補間できなかった頂点」になります。実用には拡張モードを使ってください。",
+    ]),
+    (u"モード: 拡張・小パーツ対応", [
+        u"論文の処理に、実用向けの独自処理を加えたモードです。",
+        u"・点群補間: メッシュの辺ではなく近くの点どうしをつないで補間。ボタン・ポーチ等の別パーツも下の布と一緒に動く",
+        u"・頂点の溶接: 同じ位置にある頂点をまとめて計算(UV の境目で割れない)",
+        u"・別パーツの救済: コピーできる頂点が無いパーツは、距離だけで基準点を補う",
+        u"・インフルエンス数の制限と、0.0001 未満の値の削除",
+        u"注意: 補間方法が服全体で変わります。左右の脚・脇・重なった布など、近いけれど別々に動かしたい場所も"
+        u"つながりやすくなります。体の近くの硬い物(バックパック等)は周りに引っ張られやすくなります。",
+        u"Blender アドオン robust-weight-transfer を参考にしていますが、点群補間は独自の簡易実装で、"
+        u"同じ結果にはなりません。",
     ]),
     (u"距離", [
         u"服の頂点から体の表面までがこの距離以内なら、体のウェイトをそのままコピーします。"
         u"これより遠い頂点は補間に回します。",
-        u"単位は右のメニューで選びます。% = 服のバウンディングボックス対角長に対する割合(論文の既定 5%)、"
-        u"cm = 絶対距離(Blender版の既定 5cm)。",
-        u"上げる → コピーが増え、普通の最近接コピーに近づきます。",
-        u"下げる → 補間が増え、体から離れた布がなめらかになります。",
+        u"単位は右のメニューで選びます。% = 服のバウンディングボックス対角長に対する割合(論文の既定 5%)、cm = 絶対距離。",
+        u"上げる → コピーが増え、普通の最近接コピーに近づきます。下げる → 補間が増えます。",
     ]),
     (u"角度 (°)", [
-        u"服と体の向き(法線)のずれがこの角度以上の頂点は、距離が近くてもコピーせず補間に回します。既定 30。",
+        u"服と体の向き(法線)のずれがこの角度以上の頂点は、距離が近くてもコピーせず補間に回します。",
+        u"既定 30° は公式 Python 実装の値です。論文本文では 35° と書かれています。",
         u"股や脇で、反対側の脚や胴のウェイトを拾ってしまうのを防ぐための条件です。",
     ]),
     (u"スムース回数 / スムース強さ", [
-        u"補間した部分とその周辺だけを周りの頂点と平均して、コピーした部分との境目をなじませます。",
-        u"既定は 10回 / 0.20(論文の公式実装と同じ)。回数 0 で無効になります。",
-        u"上げすぎるとウェイトがぼやけます。",
+        u"補間した部分とその周辺だけを周りの頂点と平均して、コピーした部分との境目をなじませます。回数 0 で無効。",
+        u"論文準拠: 公式と同じ範囲・順序で計算(既定 10回 / 0.2)。",
+        u"拡張: 補間頂点から空間的な距離以内の頂点を、まとめて更新(既定はオフ)。",
     ]),
     (u"最大インフルエンス", [
         u"1頂点あたりのインフルエンス(ジョイント)数の上限です。超えた分は小さい順に削って正規化します。",
-        u"0 のときは体の skinCluster の設定(maxInfluences)に合わせます。",
-        u"ゲームエンジンの制限(4本・8本など)に合わせるときに使います。",
+        u"0 のときは体の skinCluster の設定(maxInfluences)に合わせます。論文準拠モードでは使いません(制限なし)。",
     ]),
     (u"出力先", [
         u"skinCluster: 服の skinCluster に直接書き込みます。",
@@ -857,29 +976,28 @@ HELP_DETAIL = [
         u"マスクを塗ると、部位ごとに「最近接」と「補間」を選べます。再実行時は RWT_* の2枚だけ作り直します。",
     ]),
     (u"裏面もコピー", [
-        u"厚みのある服や裏地の内側の面は、体と逆向きになります。オンにすると、こうした面もコピーの対象にします。",
-        u"補間される頂点が多すぎるときに試してください。既定オフ。",
+        u"厚みのある服や裏地の内側の面は、体と逆向きになります。オンにすると、こうした面もコピーの対象にします"
+        u"(論文の任意オプション)。補間される頂点が多すぎるときに試してください。",
     ]),
     (u"選択頂点を補間", [
         u"オンにして、服の頂点を選択した状態(体 → 服の頂点 の順)で転写すると、選んだ頂点は体からコピーせず、"
-        u"周りから補間します。",
+        u"周りから補間します(論文 3.4 のマスク)。どちらのモードでも必ず守られます。",
         u"例: 襟が顎のウェイトを拾ってしまうとき、襟の頂点を選んで使います。",
     ]),
-    (u"安全モード", [
+    (u"補間できなかった頂点", [
+        u"コピーできる頂点が1つも無い別パーツ(ボタン等)は、補間の基準が無いため補間できません。"
+        u"その頂点には最近接コピーの値を入れ、結果欄に件数を表示します。「補間できなかった頂点を選択」で確認できます。",
+        u"拡張モードでは、距離だけで基準点を補って補間します。ただしマスクで指定した頂点は基準点にしません。",
+    ]),
+    (u"安全モード(拡張のみ)", [
         u"潰れた三角形などでメッシュが壊れていて結果が乱れるときだけ使います。",
-        u"計算を安定させる代わりに、論文の式から少し外れます。既定オフ。",
+        u"計算を安定させる代わりに、論文の式から少し外れます。",
     ]),
     (u"完了後に補間頂点を選択", [
-        u"転写後、補間で埋めた頂点を選択します。どこが補間になったかの確認用です。",
-        u"結果欄の「補間頂点を選択」ボタンでも、あとから選択できます。",
+        u"転写後、補間で埋めた頂点を選択します。結果欄の「補間頂点を選択」ボタンでも選べます。",
     ]),
-    (u"設定プリセット(編集メニュー)", [
-        u"論文の既定値にする: 公式実装と同じ値(距離 5% / 角度 30 / 裏面なし / 標準 / スムース 10回・0.2 / "
-        u"最大インフルエンスは体と同じ)。詳細設定の「リセット」も同じです。",
-        u"Blender版の設定にする: Blender アドオン robust-weight-transfer の既定値に相当"
-        u"(距離 5cm / 角度 30 / 裏面もコピー / 小パーツ追従 / スムースなし / 最大インフルエンス 4)。",
-        u"違い: Blender版はインフルエンス数を周囲となじませながら削り、最後の正規化はしません。"
-        u"このツールは小さい順に削って正規化します。",
+    (u"既定値に戻す", [
+        u"編集メニュー、または詳細設定の「リセット」で、今のモードの設定を既定値に戻します。",
     ]),
 ]
 
@@ -939,20 +1057,21 @@ def _maya_main_window():
     return wrapInstance(int(ptr), QtWidgets.QWidget) if ptr else None
 
 
-def _opt_get(key):
-    name = _OPT + key
+def _opt_get(key, mode):
+    name = "%sm%d_%s" % (_OPT, mode, key)
+    d = MODE_DEFAULTS[mode][key]
     if cmds.optionVar(exists=name):
         v = cmds.optionVar(q=name)
-        d = DEFAULTS[key]
         return bool(v) if isinstance(d, bool) else type(d)(v)
-    return DEFAULTS[key]
+    return d
 
 
-def _opt_set(key, value):
+def _opt_set(key, value, mode):
+    name = "%sm%d_%s" % (_OPT, mode, key)
     if isinstance(value, (bool, int)):
-        cmds.optionVar(iv=(_OPT + key, int(value)))
+        cmds.optionVar(iv=(name, int(value)))
     else:
-        cmds.optionVar(fv=(_OPT + key, float(value)))
+        cmds.optionVar(fv=(name, float(value)))
 
 
 def _selected_target_vertices(target):
@@ -1086,8 +1205,7 @@ def _build_window_class():
             # メニュー
             bar = QtWidgets.QMenuBar(self)
             m_edit = bar.addMenu(u"編集")
-            m_edit.addAction(u"論文の既定値にする", self._reset)
-            m_edit.addAction(u"Blender版の設定にする", self._preset_blender)
+            m_edit.addAction(u"このモードの既定値に戻す", self._reset)
             m_help = bar.addMenu(u"ヘルプ")
             m_help.addAction(u"各項目の説明...", show_help)
             m_help.addAction(u"論文ページを開く", lambda: cmds.launch(web=PAPER_URL))
@@ -1095,15 +1213,15 @@ def _build_window_class():
             m_help.addAction(u"バージョン情報", show_about)
             root.setMenuBar(bar)
 
-            # 補間方法
+            # モード
             row = QtWidgets.QHBoxLayout()
-            lab = QtWidgets.QLabel(u"補間方法")
-            lab.setToolTip(_TIPS[u"補間方法"])
-            self.interp = QtWidgets.QComboBox()
-            self.interp.addItems([u"標準", u"小パーツ追従"])
-            self.interp.setToolTip(_TIPS[u"補間方法"])
+            lab = QtWidgets.QLabel(u"モード")
+            lab.setToolTip(_TIPS[u"モード"])
+            self.mode = QtWidgets.QComboBox()
+            self.mode.addItems(MODE_NAMES)
+            self.mode.setToolTip(_TIPS[u"モード"])
             row.addWidget(lab)
-            row.addWidget(self.interp, 1)
+            row.addWidget(self.mode, 1)
             root.addLayout(row)
 
             # 詳細設定(折りたたみ)
@@ -1181,7 +1299,7 @@ def _build_window_class():
             add(u"", self.select_after, u"完了後に補間頂点を選択")
             reset = QtWidgets.QPushButton(u"リセット")
             reset.setObjectName("rwtFlat")
-            reset.setToolTip(u"既定値(論文の公式実装と同じ値)に戻す")
+            reset.setToolTip(u"今のモードの設定を既定値に戻す")
             reset.clicked.connect(self._reset)
             rb = QtWidgets.QHBoxLayout()
             rb.addStretch(1)
@@ -1220,7 +1338,14 @@ def _build_window_class():
             sel_btn.setObjectName("rwtFlat")
             sel_btn.setToolTip(_TIPS[u"完了後に補間頂点を選択"])
             sel_btn.clicked.connect(lambda: select_inpainted())
-            rl.addWidget(sel_btn)
+            btns = QtWidgets.QVBoxLayout()
+            btns.addWidget(sel_btn)
+            self.unsolved_btn = QtWidgets.QPushButton(u"補間できなかった頂点を選択")
+            self.unsolved_btn.setObjectName("rwtFlat")
+            self.unsolved_btn.setToolTip(_TIPS[u"補間できなかった頂点"])
+            self.unsolved_btn.clicked.connect(lambda: select_unsolved())
+            btns.addWidget(self.unsolved_btn)
+            rl.addLayout(btns)
             self.result.setVisible(False)
             root.addWidget(self.result)
             root.addStretch(1)
@@ -1233,7 +1358,6 @@ def _build_window_class():
                 "smooth_iter": self.smooth_iter, "smooth_strength": self.smooth_strength,
                 "max_inf": self.max_inf, "mask": self.mask, "clamp": self.clamp,
                 "output": self.output, "select_after": self.select_after,
-                "interp": self.interp,
             }
 
         @staticmethod
@@ -1253,32 +1377,58 @@ def _build_window_class():
             else:
                 w.setValue(v)
 
-        def _load_settings(self):
+        def _cur_mode(self):
+            return self.mode.currentIndex()
+
+        def _load_mode_settings(self, mode):
             for k, w in self._widgets().items():
                 try:
-                    self._put(w, _opt_get(k))
+                    self._put(w, _opt_get(k, mode))
                 except Exception:
-                    self._put(w, DEFAULTS[k])
+                    self._put(w, MODE_DEFAULTS[mode][k])
             if not self.ng_ok and self.output.currentIndex() == 1:
                 self.output.setCurrentIndex(0)
+            self._update_mode_ui()
+
+        def _save_mode_settings(self, mode):
+            for k, w in self._widgets().items():
+                _opt_set(k, self._val(w), mode)
+
+        def _load_settings(self):
+            m = cmds.optionVar(q=_OPT + "mode") if cmds.optionVar(exists=_OPT + "mode") else 0
+            self.mode.blockSignals(True)
+            self.mode.setCurrentIndex(int(m) if int(m) in MODE_DEFAULTS else 0)
+            self.mode.blockSignals(False)
+            self._shown_mode = self._cur_mode()
+            self._load_mode_settings(self._shown_mode)
+            self.mode.currentIndexChanged.connect(self._on_mode)
             self.fold.setChecked(bool(cmds.optionVar(q=_OPT + "advOpen"))
                                  if cmds.optionVar(exists=_OPT + "advOpen") else False)
-            self._update_hint()
 
         def _save_settings(self):
-            for k, w in self._widgets().items():
-                _opt_set(k, self._val(w))
+            self._save_mode_settings(self._shown_mode)
+            cmds.optionVar(iv=(_OPT + "mode", self._cur_mode()))
             cmds.optionVar(iv=(_OPT + "advOpen", int(self.fold.isChecked())))
 
+        def _on_mode(self, idx):
+            self._save_mode_settings(self._shown_mode)  # 切り替え前のモードの設定を保存
+            self._shown_mode = idx
+            self._load_mode_settings(idx)
+            cmds.optionVar(iv=(_OPT + "mode", idx))
+            self._set_status(u"")
+
+        def _update_mode_ui(self):
+            paper = self._cur_mode() == MODE_PAPER
+            for w in (self.max_inf, self.clamp):
+                w.setEnabled(not paper)
+
         def _reset(self):
-            self._apply(DEFAULTS)
+            self._load_mode_defaults()
 
-        def _preset_blender(self):
-            self._apply(PRESET_BLENDER)
-
-        def _apply(self, values):
+        def _load_mode_defaults(self):
+            mode = self._cur_mode()
             for k, w in self._widgets().items():
-                self._put(w, values.get(k, DEFAULTS[k]))
+                self._put(w, MODE_DEFAULTS[mode][k])
             if not self.ng_ok and self.output.currentIndex() == 1:
                 self.output.setCurrentIndex(0)
             self._save_settings()
@@ -1348,7 +1498,8 @@ def _build_window_class():
                 clamp_cot=self.clamp.isChecked(),
                 output="ngskin" if self.output.currentIndex() == 1 else "skin",
                 max_influences=self.max_inf.value() or None,
-                interp="pointcloud" if self.interp.currentIndex() == 1 else "mesh",
+                mode="paper" if self._cur_mode() == MODE_PAPER else "extended",
+                interp="pointcloud",  # 拡張モードでのみ使われる
             )
             n = len(targets)
             state = {"i": 0}
@@ -1396,12 +1547,20 @@ def _build_window_class():
                 self._refresh_selection()
             QtWidgets.QApplication.restoreOverrideCursor()
             self.progress.setValue(100)
-            lines = [u"<b>完了</b>  %.1f 秒" % (time.time() - t0)]
+            lines = [u"<b>完了</b>  %.1f 秒  (%s)" % (time.time() - t0,
+                                                      MODE_NAMES[self._cur_mode()])]
+            any_unsolved = False
             for tgt, res, dt in results:
                 total = res["known"] + res["inpainted"]
                 lines.append(u"%s  コピー %.0f%% / 補間 %.0f%%"
                              % (_short(tgt), 100.0 * res["known"] / max(total, 1),
                                 100.0 * res["inpainted"] / max(total, 1)))
+                if res.get("unsolved"):
+                    any_unsolved = True
+                    lines.append(u"<span style='color:#e0b050'>  ⚠ 補間できなかった別パーツ %d 個"
+                                 u"(%d 頂点)は最近接コピー</span>"
+                                 % (res["unsolved_parts"], res["unsolved"]))
+            self.unsolved_btn.setVisible(any_unsolved)
             self.result_label.setText(u"<br>".join(lines))
             self.result.setVisible(True)
             self._set_status(u"")
