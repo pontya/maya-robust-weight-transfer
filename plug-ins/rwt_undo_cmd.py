@@ -41,19 +41,36 @@ class RwtSetSkinWeights(om.MPxCommand):
         self._old, _ = fn.getWeights(data["dag"], data["comp"])
         self.redoIt()
 
+    @staticmethod
+    def _normalize_plug(skin):
+        return om.MFnDependencyNode(skin).findPlug("normalizeWeights", False)
+
     def redoIt(self):
         d = self._data
         fn = oma.MFnSkinCluster(d["skin"])
         n_all = len(d["all_idx"])
-        # 全インフルエンスを 0 に -> 使うインフルエンスだけ書く
-        fn.setWeights(d["dag"], d["comp"], d["all_idx"],
-                      om.MDoubleArray(d["num_verts"] * n_all, 0.0), False, False)
-        fn.setWeights(d["dag"], d["comp"], d["idx"], d["values"], False, False)
+        # 書き込み中は自動正規化を止める(0 にした直後に Maya が値を補うのを防ぐ)
+        plug = self._normalize_plug(d["skin"])
+        mode = plug.asInt()
+        plug.setInt(0)
+        try:
+            # 全インフルエンスを 0 に -> 使うインフルエンスだけ書く
+            fn.setWeights(d["dag"], d["comp"], d["all_idx"],
+                          om.MDoubleArray(d["num_verts"] * n_all, 0.0), False, False)
+            fn.setWeights(d["dag"], d["comp"], d["idx"], d["values"], False, False)
+        finally:
+            plug.setInt(mode)
 
     def undoIt(self):
         d = self._data
         fn = oma.MFnSkinCluster(d["skin"])
-        fn.setWeights(d["dag"], d["comp"], d["all_idx"], self._old, False, False)
+        plug = self._normalize_plug(d["skin"])
+        mode = plug.asInt()
+        plug.setInt(0)
+        try:
+            fn.setWeights(d["dag"], d["comp"], d["all_idx"], self._old, False, False)
+        finally:
+            plug.setInt(mode)
 
 
 def initializePlugin(obj):

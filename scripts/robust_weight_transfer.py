@@ -36,7 +36,7 @@ try:  # 任意: あれば直接法で高速に解く
 except Exception:  # pragma: no cover
     HAS_SCIPY = False
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 WINDOW = "robustWeightTransferWin"
 _last_inpainted = {"mesh": None, "ids": [], "unsolved": []}
 _PENDING = {}  # rwtSetSkinWeights コマンドへの受け渡し用
@@ -705,8 +705,8 @@ def _transfer(source, target, dist_ratio, angle, allow_flip, max_influences,
         % ((~known).sum() - orphan_v.sum(), n_parts, orphan_v.sum(), time.time() - t))
 
     W, bad = _postprocess(W, max_influences, prune=0.0 if paper else 1e-4)
-    if bad.any():
-        W[bad] = W_cp[bad] / np.maximum(W_cp[bad].sum(1, keepdims=True), 1e-12)
+    if bad.any():  # 全部 0 になった頂点は最近接コピーで代用(インフルエンス数の制限もかける)
+        W[bad], _ = _postprocess(W_cp[bad], max_influences, prune=0.0 if paper else 1e-4)
 
     # --- 書き込み ---
     t = time.time()

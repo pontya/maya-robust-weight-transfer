@@ -21,13 +21,44 @@ Maya 標準の `Copy Skin Weights`(最近接)で起きやすい、股で布が�
 - 出力先を **skinCluster** / **ngSkinTools2 のレイヤー**(最近接コピー + 補間結果 + マスク)から選択
 - 7万頂点クラスの衣装で 10〜20 秒程度
 
+## 2つの版
+
+| | 通常版(`scripts/` + `plug-ins/`) | 1ファイル版(`single_file/`) |
+|---|---|---|
+| 導入 | `install.py` をドラッグ&ドロップ | ファイル1つをコピー |
+| Undo | Ctrl+Z 1回で戻せる(プラグインを使う) | **できない**(転写すると Undo 履歴もクリア) |
+| プラグインの許可 | 初回に必要 | 不要 |
+| Python | 3 | 2.7 / 3(Maya 2022 の Python 2 モード対応) |
+| numpy / scipy | Maya の Python に入れる | Python 3 の mayapy に入れる(下記) |
+
+両方を同時に入れないでください(どちらも `robust_weight_transfer` という名前で読み込まれます)。転写の結果は同じです。
+
+### 1ファイル版のセットアップ(会社の PC など)
+
+1. numpy / scipy を **Python 3 の mayapy** に pip で入れます(コマンドプロンプトで実行。パスは Maya のバージョンに合わせて変更)
+   ```bat
+   "C:\Program Files\Autodesk\Maya2022\bin\mayapy.exe" -m pip install --user numpy scipy
+   ```
+   - Python 2 モードの Maya 2022 でも、入れる先は `mayapy.exe`(Python 3.7)です。`mayapy2.exe` ではありません
+   - pip が Python 3.7 に合うバージョン(numpy 1.21 / scipy 1.7 系)を自動で選びます
+2. `single_file/robust_weight_transfer.py` を `Documents/maya/scripts/` にコピーします
+3. Maya のスクリプトエディタ(Python)で実行します
+   ```python
+   import robust_weight_transfer as rwt
+   rwt.show()
+   ```
+   シェルフに登録する場合は `rwt.install_shelf()`
+
+計算のしくみ: Maya の Python で numpy / scipy を読めればそのまま Maya の中で計算します。読めない場合(Python 2 モードなど)は、Maya に付属する Python 3 の mayapy を別プロセスで起動して計算します。どちらでも結果は同じです(検証済み)。
+ツールの **ヘルプ → 計算環境を確認** で、使われる Python と numpy / scipy の有無を確認できます。mayapy が見つからない場合は **ヘルプ → Python 3 の場所を指定**(または環境変数 `RWT_PYTHON3`)で指定してください。
+
 ## 動作環境
 
 | Maya | 状態 | 必要なもの |
 |---|---|---|
 | 2027 | 動作確認済み(Windows) | scipy |
 | 2023〜2026 | 動作する見込み(未検証) | scipy(numpy が無ければ numpy も) |
-| 2022 | 未検証 | numpy, scipy(1.7 系) |
+| 2022 | 未検証(1ファイル版は Python 2 モードにも対応) | numpy, scipy(1.7 系) |
 
 - **numpy**: 最近の Maya には同梱(2027 は同梱を確認済み)。無い場合はインストーラーが pip で入れます
 - **scipy**: 追加インストールが必要(インストーラーが pip で入れます)
@@ -132,7 +163,8 @@ rwt.transfer("body", "cloth", mode="extended", interp="pointcloud",
 - 拡張モードの点群補間は簡易な自前実装です(Blender版が使う robust_laplacian とは別物)。服全体の補間方法が変わるため、左右の脚・脇・重なった布など、近いけれど別々に動かしたい場所もつながりやすくなります
 - 拡張モードの溶接は同じ位置の頂点をまとめるため、同じ位置にある別レイヤーもまとめられることがあります
 - 最大インフルエンスは小さい順に打ち切ります(周囲となじませながら削る処理はありません)
-- ウェイトの書き込みには Undo 用の小さなプラグイン(`plug-ins/rwt_undo_cmd.py`)を使います
+- 通常版は、ウェイトの書き込みに Undo 用の小さなプラグイン(`plug-ins/rwt_undo_cmd.py`)を使います
+- 1ファイル版は Maya 2027(Python 3)で、Maya 内の計算と別プロセスの計算が同じ結果になることを確認しています。Maya 2022 の Python 2 モードでは未検証です(Python 2 の文法チェックのみ)
 
 ## アンインストール
 
